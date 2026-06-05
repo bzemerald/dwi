@@ -1,0 +1,18 @@
+{
+    "descriptions" : [
+        {
+            "datatype": "dwi",
+            "suffix": "dwi",
+            "criteria": {
+                "SeriesDescription": "*DTI*"
+            }
+        },
+        {
+            "datatype": "anat",
+            "suffix": "T1w",
+            "criteria": {
+                "SeriesDescription": "*3D T1*"
+            }
+        }
+    ]
+}
