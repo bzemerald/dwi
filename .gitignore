@@ -1,0 +1,29 @@
+# Sensitive data
+private/
+sourcedata/
+*.dcm
+*.IMA
+
+# Large neuroimaging files
+*.nii
+*.nii.gz
+*.mgz
+*.mif
+*.fib.gz
+*.trk
+*.tck
+
+# Temporary/log files
+*tmp*/
+logs/
+*.log
+
+# can be regenerated
+/derivatives
+
+# OS/editor
+.DS_Store
+.vscode/
+__pycache__/
+
+bids_path.py
