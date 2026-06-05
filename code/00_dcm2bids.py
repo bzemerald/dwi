@@ -15,7 +15,8 @@ sourcedata/group2)
 
 2. Every subject only has one session.
 
-Does not check config, so beware of duplicates/missing files.
+Only adds a subject to BIDS if every config description has exactly one match
+among dcm2bids_helper-generated sidecar JSON files.
 
 Usage:
 python3 00_dcm2bids <path_to_config>
@@ -28,6 +29,15 @@ from pathlib import Path
 import re
 import sys
 import csv
+import json
+import fnmatch
+import shutil
+import subprocess
+
+
+def load_json(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def get_existing_max_id(out_dir):
@@ -75,6 +85,109 @@ def append_private_participant(participants_path, participant_id, original_subje
         writer.writerow([participant_id, original_subject_dir, group])
 
 
+def value_matches(actual, expected):
+    """
+    Approximate dcm2bids criteria matching.
+
+    Supports:
+    - exact equality for numbers/bools
+    - shell-style wildcards for strings, e.g. "*DTI*"
+    - list of accepted values
+    """
+    if isinstance(expected, list):
+        return any(value_matches(actual, item) for item in expected)
+
+    if isinstance(expected, str):
+        return fnmatch.fnmatchcase(str(actual), expected)
+
+    return actual == expected
+
+
+def sidecar_matches_criteria(sidecar, criteria):
+    for key, expected in criteria.items():
+        if key not in sidecar:
+            return False
+
+        if not value_matches(sidecar[key], expected):
+            return False
+
+    return True
+
+
+def description_label(desc, idx):
+    label_parts = []
+
+    for key in ("id", "datatype", "suffix", "customLabels", "custom_entities"):
+        if key in desc:
+            label_parts.append(f"{key}={desc[key]}")
+
+    if label_parts:
+        return ", ".join(label_parts)
+
+    return f"description[{idx}]"
+
+
+def check_config_exactly_one_match(config_path, helper_dir):
+    """
+    Return (ok, messages).
+
+    ok=True means every config descriptions[] entry has exactly one matching
+    helper JSON sidecar.
+    """
+    config = load_json(config_path)
+    descriptions = config.get("descriptions", [])
+
+    if not descriptions:
+        return False, ["Config has no descriptions[] entries."]
+
+    helper_dir = Path(helper_dir)
+
+    sidecars = []
+    for path in sorted(helper_dir.glob("*.json")):
+        try:
+            sidecars.append((path.name, load_json(path)))
+        except Exception as e:
+            return False, [f"Could not read helper JSON {path}: {e}"]
+
+    if not sidecars:
+        return False, [f"No helper JSON sidecars found in {helper_dir}"]
+
+    messages = []
+    failed = []
+
+    for idx, desc in enumerate(descriptions):
+        criteria = desc.get("criteria")
+        label = description_label(desc, idx)
+
+        if not criteria:
+            failed.append((label, "missing or empty criteria", []))
+            continue
+
+        matched = [
+            filename
+            for filename, sidecar in sidecars
+            if sidecar_matches_criteria(sidecar, criteria)
+        ]
+
+        if len(matched) != 1:
+            failed.append((label, criteria, matched))
+
+    if failed:
+        messages.append("Config check failed: not every description matched exactly one helper sidecar.")
+
+        for label, criteria, matched in failed:
+            messages.append(f"  Failed: {label}")
+            messages.append(f"    criteria: {criteria}")
+            messages.append(f"    matched {len(matched)} files")
+
+            for name in matched:
+                messages.append(f"      - {name}")
+
+        return False, messages
+
+    return True, ["Config check passed: every description matched exactly one helper sidecar."]
+
+
 def main():
     start = time()
 
@@ -89,6 +202,7 @@ def main():
     bids_dir = Path(BIDS_DIR)
     sourcedata_dir = bids_dir / "sourcedata"
     private_participants = bids_dir / "private" / "participants.tsv"
+    tmp_dir = bids_dir / "tmp_dcm2bids"
 
     if not bids_dir.is_dir():
         sys.exit(f"BIDS_DIR does not exist or is not a directory: {bids_dir}")
@@ -132,17 +246,55 @@ def main():
             participant_id = f"sub-{participant_label}"
 
             print()
-            print(f"Converting: {subject_dir}")
+            print(f"Checking: {subject_dir}")
             print(f"Group: {group}")
+            print(f"Candidate ID: {participant_id}")
+
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+
+            try:
+                run([
+                    "dcm2bids_helper",
+                    "-d", str(subject_dir),
+                    "-o", str(bids_dir),
+                ])
+            except subprocess.CalledProcessError:
+                print(f"Skipping {subject_dir}: dcm2bids_helper failed.", file=sys.stderr)
+                continue
+
+            helper_dir = tmp_dir / "helper"
+
+            ok, messages = check_config_exactly_one_match(
+                config_path=config_path,
+                helper_dir=helper_dir,
+            )
+
+            for message in messages:
+                print(message, file=sys.stdout if ok else sys.stderr)
+
+            if not ok:
+                print(f"Skipping {subject_dir}: config did not match exactly once for every entry.")
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+                continue
+
+            print(f"Converting: {subject_dir}")
             print(f"Assigned ID: {participant_id}")
 
-            run([
-                "dcm2bids",
-                "-d", str(subject_dir),
-                "-p", participant_label,
-                "-c", str(config_path),
-                "-o", str(bids_dir),
-            ])
+            try:
+                run([
+                    "dcm2bids",
+                    "-d", str(subject_dir),
+                    "-p", participant_label,
+                    "-c", str(config_path),
+                    "-o", str(bids_dir),
+                ])
+            except subprocess.CalledProcessError:
+                print(f"dcm2bids failed for {subject_dir}; ID was not recorded.", file=sys.stderr)
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+                continue
 
             append_private_participant(
                 participants_path=private_participants,
@@ -154,6 +306,9 @@ def main():
             print(f"Recorded {participant_id} -> {subject_dir.name}, group={group}")
 
             next_id += 1
+
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
 
     elapsed = time() - start
     print()
