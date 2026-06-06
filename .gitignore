@@ -1,10 +1,11 @@
 # Sensitive data
 private/
-sourcedata/
+sourcedata
 *.dcm
 *.IMA
 
 # Large neuroimaging files
+sub-*
 *.nii
 *.nii.gz
 *.mgz
